@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# IDE specific
+.vscode/
+.idea/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
