@@ -1,126 +1,146 @@
 import asyncio
 import os
-from langchain_mcp_adapters.tools import load_mcp_tools
+import subprocess
+import json
+import time
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 from langchain.tools import Tool
 from dotenv import load_dotenv
 import traceback
-import json
-from typing import Optional, Dict, Any
-from contextlib import asynccontextmanager
+from typing import Dict, Any
 
 # Load environment variables
 load_dotenv()
 
-class DatabaseConnection:
+class QueryAnalyzer:
     def __init__(self):
-        self.client = None
-        self.session = None
-        self._lock = asyncio.Lock()
-        self.server_params = StdioServerParameters(
-            command="docker",
-            args=["run", "--rm", "-i", "mcp/postgres:latest", os.getenv("DATABASE_URL")],
-        )
+        self.command_map = {
+            "SELECT": "4",  # Query data
+            "LIST_TABLES": "5",  # List tables
+            "DESCRIBE": "6",  # Describe table
+            "CREATE": "2",  # Create table
+            "INSERT": "3",  # Insert data
+            "UPDATE": "7",  # Update data
+            "DELETE": "8",  # Delete data
+            "CREATE_INDEX": "9",  # Create index
+            "DROP_INDEX": "10",  # Drop index
+            "DROP": "11",  # Drop table
+        }
 
-    async def connect(self):
-        async with self._lock:
-            if not self.session:
-                self.client = stdio_client(self.server_params)
-                read, write = await self.client.__aenter__()
-                self.session = ClientSession(read, write)
-                await self.session.__aenter__()
-                await self.session.initialize()
-        return self.session
+    async def analyze_query(self, query_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        command = self.command_map.get(query_type)
+        if not command:
+            raise ValueError(f"Unsupported query type: {query_type}")
+        
+        return {
+            "command_number": command,
+            "params": params
+        }
 
-    async def disconnect(self):
-        async with self._lock:
-            if self.session:
-                await self.session.__aexit__(None, None, None)
-                self.session = None
-            if self.client:
-                await self.client.__aexit__(None, None, None)
-                self.client = None
+class MCPClient:
+    def __init__(self):
+        self.process = None
+        self.mcp_path = r"C:\Users\Asus\Documents\LN\MCP\postgres-mcp"
 
-class DatabaseTool:
-    def __init__(self, connection: DatabaseConnection, mcp_tool: Any):
-        self.connection = connection
-        self.mcp_tool = mcp_tool
-        self.schema_cache = None
-
-    async def get_schema(self) -> Dict[str, Any]:
-        if not self.schema_cache:
-            try:
-                await self.connection.connect()
-                schema_query = {"sql": "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'"}
-                self.schema_cache = await self.mcp_tool.arun(schema_query)
-            except Exception as e:
-                print(f"[WARNING] Failed to fetch schema: {str(e)}")
-                self.schema_cache = {}
-        return self.schema_cache
-
-    async def execute_query(self, query_input: Dict[str, Any]) -> Dict[str, Any]:
+    async def execute_command_sequence(self, command_info: Dict[str, Any]) -> str:
         try:
-            await self.connection.connect()
+            print("[DEBUG] Starting MCP client process...")
+            os.chdir(self.mcp_path)
             
-            if isinstance(query_input, str):
-                query_input = json.loads(query_input)
-            
-            if not isinstance(query_input, dict):
-                raise ValueError("Query input must be a dictionary or valid JSON string")
-            
-            sql_query = query_input.get('query')
-            if not sql_query:
-                raise ValueError("Query input must contain a 'query' key")
+            self.process = subprocess.Popen(
+                'cargo run --example mcp_client',
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=True
+            )
 
-            formatted_query = {"sql": sql_query}
-            
-            result = await self.mcp_tool.arun(formatted_query)
-            return result
+            # Wait for initial output to clear
+            print("[DEBUG] Waiting for MCP client to initialize...")
+            time.sleep(2)  # Wait for tool schema output
 
-        except json.JSONDecodeError:
-            raise ValueError("Invalid JSON format in query input")
+            def read_output():
+                output = ""
+                while True:
+                    line = self.process.stdout.readline()
+                    # print(f"[DEBUG PROCESS LINE 1]: {line}")
+                    if not line or "Available commands:" in line or "Enter connection string (postgresql://user:pass@host:port/db):" in line:
+                        break
+                    output += line
+                return output.strip()
+
+            def send_command(cmd, description=""):
+                print(f"[DEBUG] Sending command: {cmd} ({description})")
+                self.process.stdin.write(f"{cmd}\n")
+                self.process.stdin.flush()
+                time.sleep(1)
+                return read_output()
+
+            # Execute commands and collect outputs
+            outputs = []
+            
+            # Connect sequence
+            outputs.append(send_command('1', "Connect"))
+            db_url = "postgresql://postgres:admin123@localhost:5432/whatsapp-supplier-agent"
+            outputs.append(send_command(db_url, "Database URL"))
+            
+            # Execute main command
+            outputs.append(send_command(command_info["command_number"], "Command number"))
+            
+            # Handle command-specific parameters
+            if command_info["command_number"] == "5":  # LIST_TABLES
+                if command_info["params"].get("schema"):
+                    outputs.append(send_command(command_info["params"]["schema"], "Schema"))
+            elif command_info["command_number"] == "4":  # SELECT
+                if command_info["params"].get("query"):
+                    outputs.append(send_command(command_info["params"]["query"], "Query"))
+            # Add more command-specific parameter handling here
+            
+            # Cleanup sequence
+            outputs.append(send_command('12', "Unregister"))
+            outputs.append(send_command('13', "Exit"))
+
+            # Get final output
+            final_output = self.process.communicate()[0]
+            
+            # Combine all outputs
+            all_output = '\n'.join(outputs + [final_output])
+            
+            # Filter relevant output
+            relevant_lines = [
+                line for line in all_output.split('\n')
+                if line.strip() and not line.strip().startswith(('Tool {', '}', '[', ']', '2025-'))
+            ]
+
+            print(f"[DEBUG] Relevant output: {relevant_lines}")
+            
+            return '\n'.join(relevant_lines)
+
         except Exception as e:
-            print(f"[DEBUG] Query execution error details: {str(e)}")
-            raise RuntimeError(f"Query execution failed: {str(e)}")
+            print(f"[ERROR] MCP client error: {str(e)}")
+            raise RuntimeError(f"MCP client error: {str(e)}")
+        finally:
+            if self.process:
+                print("[DEBUG] Cleaning up process...")
+                self.process.terminate()
+                await asyncio.sleep(1)
+                self.process.kill()
 
 class DatabaseSession:
     def __init__(self):
-        self.connection = DatabaseConnection()
-        self.db_tool = None
-        self.tools = None
+        self.analyzer = QueryAnalyzer()
+        self.client = MCPClient()
 
-    async def __aenter__(self):
-        try:
-            session = await self.connection.connect()
-            
-            mcp_tools = await load_mcp_tools(session)
-            print(f"[DEBUG] Loaded raw MCP tools: {[tool.name for tool in mcp_tools]}")
-            
-            self.db_tool = DatabaseTool(self.connection, mcp_tools[0])
-            await self.db_tool.get_schema()
-            
-            self.tools = [Tool(
-                name="query",
-                description="""Execute a SQL query on the PostgreSQL database. 
-                The query must be read-only (SELECT statements only).
-                Input should be a JSON object with a 'query' key containing the SQL query string.""",
-                func=self.db_tool.execute_query,
-                coroutine=self.db_tool.execute_query
-            )]
-            
-            return self.tools
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to setup database session: {str(e)}")
-            await self.connection.disconnect()
-            raise
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.connection.disconnect()
+    async def execute_query(self, query_info: str) -> str:
+        query_dict = json.loads(query_info)
+        command_info = await self.analyzer.analyze_query(
+            query_dict["command_type"],
+            query_dict["params"]
+        )
+        return await self.client.execute_command_sequence(command_info)
 
 async def main():
     try:
@@ -129,65 +149,79 @@ async def main():
         print("[DEBUG] Language model initialized")
 
         db_session = DatabaseSession()
-        async with db_session as tools:
-            print("\n[DEBUG] Creating prompt template...")
-            prompt = PromptTemplate.from_template(
-                """You are a PostgreSQL database assistant that helps users interact with their database.
-                
-                To accomplish your tasks, you have access to the following tools:
-                {tools}
-                
-                Use the following format:
-                Question: the input question you must answer
-                Thought: you should always think about what to do
-                Action: the action to take, should be one of [{tool_names}]
-                Action Input: the input must be a JSON object containing the SQL query
-                Observation: the result of the action
-                ... (this Thought/Action/Action Input/Observation can repeat N times)
-                Thought: I now know the final answer
-                Final Answer: provide a clear explanation of what was done and the results
-                
-                Remember: 
-                - Always format Action Input as a JSON object with the 'query' key containing the SQL query string
-                - Only use READ-ONLY queries (SELECT statements)
-                - Explain the results in a user-friendly manner
-                - Handle errors gracefully and suggest fixes
-                
-                Begin!
-                
-                Question: {input}
-                Thought:{agent_scratchpad}"""
-            )
-            print("[DEBUG] Prompt template created")
+        tools = [Tool(
+            name="analyze_and_execute_query",
+            description="""Analyze and execute database commands through MCP client.
+            Available commands:
+            - SELECT: Query data (requires: query)
+            - LIST_TABLES: List all tables (requires: schema)
+            - DESCRIBE: Describe table structure (requires: table_name)
+            - CREATE: Create new table (requires: create_statement)
+            - INSERT: Insert data (requires: insert_statement)
+            - UPDATE: Update data (requires: update_statement)
+            - DELETE: Delete data (requires: delete_statement)
+            Input should be a JSON object with 'command_type' and required parameters.""",
+            func=lambda x: asyncio.run(db_session.execute_query(x)),
+            coroutine=lambda x: db_session.execute_query(x)
+        )]
 
-            print("\n[DEBUG] Creating agent...")
-            agent = create_react_agent(llm, tools, prompt)
-            agent_executor = AgentExecutor(
-                agent=agent,
-                tools=tools,
-                verbose=True,
-                max_iterations=3,
-                handle_parsing_errors=True
-            )
-            print("[DEBUG] Agent created successfully")
+        print("\n[DEBUG] Creating prompt template...")
+        prompt = PromptTemplate.from_template(
+            """You are a PostgreSQL database assistant that helps users interact with their database through an MCP client interface.
+            
+            Available tools: {tool_names}
+            
+            To accomplish your tasks, you have access to the following tools:
+            {tools}
+            
+            When using the analyze_and_execute_query tool, you must provide:
+            1. command_type: The type of operation (SELECT, LIST_TABLES, etc.)
+            2. Required parameters for that command type
+            
+            Use the following format:
+            Question: the input question you must answer
+            Thought: you should always think about what to do
+            Action: analyze_and_execute_query
+            Action Input: {{"command_type": "COMMAND", "params": {{required_parameters}}}}
+            Observation: the result of the action
+            Thought: I now know the final answer
+            Final Answer: provide a clear explanation of what was done and the results
+            
+            Begin!
+            
+            Question: {input}
+            Thought:{agent_scratchpad}"""
+        )
+        print("[DEBUG] Prompt template created")
 
-            while True:
-                try:
-                    user_query = input("\nPlease enter your database query in plain English (or 'exit' to quit): ")
-                    if user_query.lower() == 'exit':
-                        break
-                        
-                    print(f"[DEBUG] Received user query: {user_query}")
-                    print("\n[DEBUG] Executing agent...")
-                    response = await agent_executor.ainvoke({"input": user_query})
-                    print("[DEBUG] Agent execution completed")
+        print("\n[DEBUG] Creating agent...")
+        agent = create_react_agent(llm, tools, prompt)
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=True,
+            max_iterations=3,
+            handle_parsing_errors=True
+        )
+        print("[DEBUG] Agent created successfully")
+
+        while True:
+            try:
+                user_query = input("\nPlease enter your database query in plain English (or 'exit' to quit): ")
+                if user_query.lower() == 'exit':
+                    break
                     
-                    print("\nFinal Response:")
-                    print(response)
-                    
-                except Exception as e:
-                    print(f"\n[ERROR] Query failed: {str(e)}")
-                    print("Please try another query.")
+                print(f"[DEBUG] Received user query: {user_query}")
+                print("\n[DEBUG] Executing agent...")
+                response = await agent_executor.ainvoke({"input": user_query})
+                print("[DEBUG] Agent execution completed")
+                
+                print("\nFinal Response:")
+                print(response)
+                
+            except Exception as e:
+                print(f"\n[ERROR] Query failed: {str(e)}")
+                print("Please try another query.")
 
     except Exception as e:
         print(f"\n[ERROR] An error occurred: {str(e)}")
