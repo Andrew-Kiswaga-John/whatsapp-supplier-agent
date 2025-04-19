@@ -97,6 +97,9 @@ class MCPClient:
             elif command_info["command_number"] == "4":  # SELECT
                 if command_info["params"].get("query"):
                     outputs.append(send_command(command_info["params"]["query"], "Query"))
+            elif command_info["command_number"] == "6": #DESCRIBE
+                if command_info["params"].get("table_name"):
+                    outputs.append(send_command(command_info["params"]["table_name"], "Table_name"))
             # Add more command-specific parameter handling here
             
             # Cleanup sequence
@@ -178,14 +181,39 @@ async def main():
             1. command_type: The type of operation (SELECT, LIST_TABLES, etc.)
             2. Required parameters for that command type
             
+            IMPORTANT: For ANY user query, you MUST follow this EXACT workflow in order:
+            
+            1. First, list all available tables:
+               - Use analyze_and_execute_query with command_type: "LIST_TABLES" and params: {{"schema": "public"}}
+            
+            2. Then, identify which tables are relevant to the user's query
+            
+            3. For EACH relevant table, describe its structure:
+               - Use analyze_and_execute_query with command_type: "DESCRIBE" and params: {{"table_name": "table_name_here"}}
+            
+            4. Only after understanding the schema, formulate your SQL query using ONLY columns that actually exist
+            
+            5. Execute your query and analyze the results
+            
+            NEVER skip steps 1-3. NEVER assume table structures. NEVER query columns that you haven't verified exist.
+            
             Use the following format:
             Question: the input question you must answer
-            Thought: you should always think about what to do
+            Thought: I need to follow the workflow to understand the database schema first
             Action: analyze_and_execute_query
-            Action Input: {{"command_type": "COMMAND", "params": {{required_parameters}}}}
-            Observation: the result of the action
+            Action Input: {{"command_type": "LIST_TABLES", "params": {{"schema": "public"}}}}
+            Observation: [List of tables]
+            Thought: Now I need to examine the structure of relevant tables
+            Action: analyze_and_execute_query
+            Action Input: {{"command_type": "DESCRIBE", "params": {{"table_name": "[relevant_table]"}}}}
+            Observation: [Table structure]
+            ... (repeat for each relevant table)
+            Thought: Now I understand the schema and can formulate a proper SQL query
+            Action: analyze_and_execute_query
+            Action Input: {{"command_type": "SELECT", "params": {{"query": "SELECT ... FROM ... WHERE ..."}}}}
+            Observation: [Query results]
             Thought: I now know the final answer
-            Final Answer: provide a clear explanation of what was done and the results
+            Final Answer: [Clear explanation with accurate data]
             
             Begin!
             
@@ -200,7 +228,7 @@ async def main():
             agent=agent,
             tools=tools,
             verbose=True,
-            max_iterations=3,
+            max_iterations=10,
             handle_parsing_errors=True
         )
         print("[DEBUG] Agent created successfully")
