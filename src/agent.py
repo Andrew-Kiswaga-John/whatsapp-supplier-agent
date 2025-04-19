@@ -1,88 +1,186 @@
-# agent.py
-
-from langchain.agents import Tool, AgentExecutor, create_react_agent
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from dotenv import load_dotenv
+import asyncio
 import os
-from typing import List, Dict
-from whatsapp_tool import WhatsAppTool  # Import the WhatsAppTool
+import json
+from typing import Dict, Any, List, TypedDict, Literal
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import StateGraph, END, START
+from pydantic import BaseModel
+
+# Import from your existing modules
+from postgresql_test import DatabaseSession
+from test_whatsapp import send_whatsapp_message
+from postgresql_test import create_db_agent
 
 # Load environment variables
 load_dotenv()
 
-# Initialize Gemini Pro
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro-exp-03-25", api_key=os.getenv("GOOGLE_API_KEY"))
+# Define state schema
+class AgentState(TypedDict):
+    # The input message from WhatsApp
+    input: str
+    # The sender's phone number or JID
+    sender: str
+    # Database query results
+    db_results: str
+    # Final response to send back
+    response: str
+    # Any errors that occurred
+    errors: List[str]
 
-class OrderManagementAgent:
-    def __init__(self, mcp_server_url: str):
-        self.whatsapp_tool = WhatsAppTool(mcp_server_url)
-        self.tools = self._create_tools()
-        self.agent = self._create_agent()
-        self.agent_executor = AgentExecutor.from_agent_and_tools(
-            agent=self.agent,
-            tools=self.tools,
-            verbose=True
-        )
+# Initialize the language model
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", api_key=os.getenv("GEMINI_API_KEY"))
 
-    def _create_tools(self) -> List[Tool]:
-        tools = [
-            Tool(
-                name="database_query",
-                func=self._query_database,
-                description="Use this tool to query the PostgreSQL database for order information."
-            ),
-            Tool(
-                name="generate_report",
-                func=self._generate_pdf_report,
-                description="Use this tool to generate PDF reports from order data."
-            ),
-            Tool(
-                name="send_whatsapp_message",
-                func=self.whatsapp_tool.send_message,
-                description="Use this tool to send messages via WhatsApp."
-            ),
-            Tool(
-                name="send_whatsapp_file",
-                func=self.whatsapp_tool.send_file,
-                description="Use this tool to send files via WhatsApp."
-            )
-        ]
-        return tools
+# Initialize database session from the PostgreSQL agent
+db_session = DatabaseSession()
 
-    def _create_agent(self):
-        prompt = PromptTemplate.from_template(
-            """You are an order management assistant that helps users get information about orders.
-            You can query the database, generate reports, and send WhatsApp messages.
+# Define nodes for the graph
+async def parse_whatsapp_input(state: AgentState) -> AgentState:
+    """Parse the incoming WhatsApp message to extract the database query."""
+    input_message = state["input"]
+    
+    # You can add more sophisticated parsing here if needed
+    query = input_message
+    
+    # Update state with the parsed query
+    return {
+        **state,
+        "input": query
+    }
 
-            To accomplish your tasks, you have access to the following tools:
-            {tools}
+# Replace the query_database function with this:
 
-            Use these tools to help answer the user's question: {input}
+async def query_database(state: AgentState) -> AgentState:
+    """Process the database query using the PostgreSQL agent."""
+    query = state["input"]
+    errors = []
+    db_results = ""
+    
+    try:       
+        # Create the database agent
+        db_agent = await create_db_agent()
+        
+        # Execute the query using the agent
+        result = await db_agent.ainvoke({"input": query})
+        
+        # Extract the response
+        db_results = result.get("output", "")
+        response = db_results  # Use the output directly as the response
+        
+    except Exception as e:
+        error_msg = f"Error processing database query: {str(e)}"
+        errors.append(error_msg)
+        db_results = error_msg
+        response = f"Sorry, I encountered an error while processing your query: {error_msg}"
+    
+    # Update state with query results
+    return {
+        **state,
+        "db_results": db_results,
+        "response":response,
+        "errors": errors
+    }
 
-            Take these steps:
-            1. Understand the user's request.
-            2. Query the necessary data.
-            3. Generate reports if needed.
-            4. Send the information via WhatsApp.
+async def send_response(state: AgentState) -> AgentState:
+    """Send the formatted response back to the user via WhatsApp."""
+    response = state["response"]
+    sender = state["sender"]
+    
+    # Send the response via WhatsApp using the WhatsApp agent's function
+    send_result = send_whatsapp_message({
+        "recipient": sender,
+        "message": response
+    })
+    
+    # Check if the message was sent successfully
+    if not send_result.get("success", False):
+        state["errors"].append(f"Failed to send WhatsApp response: {send_result.get('message', 'Unknown error')}")
+    
+    # Return the final state
+    return state
 
-            Remember to handle errors gracefully and provide clear feedback to the user."""
-        )
-        return create_react_agent(llm, self.tools, prompt)
+# Create the graph
+# Create the graph
+def create_workflow() -> StateGraph:
+    """Create the LangGraph workflow for the WhatsApp database query system."""
+    # Initialize the graph
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes
+    workflow.add_node("parse_input", parse_whatsapp_input)
+    workflow.add_node("query_database", query_database)
+    workflow.add_node("send_response", send_response)
+    
+    # Add edges
+    workflow.add_edge("parse_input", "query_database")
+    workflow.add_edge("query_database", "send_response")
+    workflow.add_edge("send_response", END)
+    
+    # Add the START edge - this is what's missing
+    workflow.add_edge(START, "parse_input")
+    
+    # Compile the graph
+    return workflow.compile()
 
-    def _query_database(self, query: str) -> Dict:
-        # Implementation for querying the PostgreSQL database
-        pass
+# Function to handle incoming WhatsApp messages
+async def handle_whatsapp_message(message: str, sender: str) -> Dict[str, Any]:
+    """Process an incoming WhatsApp message, query the database, and send a response."""
+    # Create the initial state
+    initial_state: AgentState = {
+        "input": message,
+        "sender": sender,
+        "db_results": "",
+        "response": "",
+        "errors": []
+    }
+    
+    # Create and run the workflow
+    workflow = create_workflow()
+    final_state = await workflow.ainvoke(initial_state)
+    
+    return {
+        "success": not final_state.get("errors", []),
+        "response": final_state.get("response", ""),
+        "errors": final_state.get("errors", [])
+    }
 
-    def _generate_pdf_report(self, data: Dict) -> str:
-        # Implementation for generating PDF reports
-        pass
+# Create a webhook handler for WhatsApp messages
+async def process_webhook_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Process webhook data from WhatsApp and return a response."""
+    try:
+        # Extract message and sender information
+        if "messages" in data and len(data["messages"]) > 0:
+            message = data["messages"][0]
+            
+            if "text" in message and "body" in message["text"]:
+                # Extract the message text
+                message_text = message["text"]["body"]
+                
+                # Extract the sender's phone number
+                sender = message["from"]
+                
+                # Process the message
+                result = await handle_whatsapp_message(message_text, sender)
+                return {"status": "success", "result": result}
+        
+        return {"status": "no_message"}
+    
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-    def run(self, user_input: str):
-        return self.agent_executor.run(user_input)
+# Example usage
+async def main():
+    # Example message and sender
+    message = "Show me all suppliers with delayed orders and give me their emails ?"
+    sender = "212600311326"  # Replace with actual sender number
+    
+    print(f"Processing message: '{message}' from {sender}")
+    result = await handle_whatsapp_message(message, sender)
+    
+    if result["success"]:
+        print(f"Successfully processed query and sent response")
+    else:
+        print(f"Errors occurred: {result['errors']}")
 
 if __name__ == "__main__":
-    mcp_server_url = "http://localhost:8080"  # Replace with your actual MCP server URL
-    agent = OrderManagementAgent(mcp_server_url)
-    # Example usage
-    # result = agent.run("Give me a report of all delayed orders.")
+    asyncio.run(main())
