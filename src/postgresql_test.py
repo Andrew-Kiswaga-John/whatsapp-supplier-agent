@@ -9,10 +9,41 @@ from langchain.prompts import PromptTemplate
 from langchain.tools import Tool
 from dotenv import load_dotenv
 import traceback
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 # Load environment variables
 load_dotenv()
+# Add a state tracking system
+class ExecutionTracker:
+    def __init__(self):
+        self.listed_tables = False
+        self.described_tables = []
+        self.executed_queries = []
+        
+    def has_listed_tables(self):
+        return self.listed_tables
+    
+    def mark_tables_listed(self):
+        self.listed_tables = True
+    
+    def has_described_table(self, table_name):
+        return table_name in self.described_tables
+    
+    def mark_table_described(self, table_name):
+        if table_name not in self.described_tables:
+            self.described_tables.append(table_name)
+    
+    def has_executed_query(self, query):
+        return query in self.executed_queries
+    
+    def mark_query_executed(self, query):
+        if query not in self.executed_queries:
+            self.executed_queries.append(query)
+    
+    def reset(self):
+        self.listed_tables = False
+        self.described_tables = []
+        self.executed_queries = []
 
 class QueryAnalyzer:
     def __init__(self):
@@ -66,7 +97,6 @@ class MCPClient:
                 output = ""
                 while True:
                     line = self.process.stdout.readline()
-                    # print(f"[DEBUG PROCESS LINE 1]: {line}")
                     if not line or "Available commands:" in line or "Enter connection string (postgresql://user:pass@host:port/db):" in line:
                         break
                     output += line
@@ -112,38 +142,160 @@ class MCPClient:
             # Combine all outputs
             all_output = '\n'.join(outputs + [final_output])
             
-            # Filter relevant output
-            relevant_lines = [
-                line for line in all_output.split('\n')
-                if line.strip() and not line.strip().startswith(('Tool {', '}', '[', ']', '2025-'))
-            ]
+            # Improved filtering and formatting of relevant output
+            relevant_lines = []
+            for line in all_output.split('\n'):
+                if line.strip() and not line.strip().startswith(('Tool {', '}', '[', ']', '2025-')):
+                    # Check if line contains JSON data
+                    if '{"' in line and '"}' in line:
+                        try:
+                            # Extract JSON part
+                            json_start = line.find('{"')
+                            json_end = line.rfind('"}') + 2
+                            json_str = line[json_start:json_end]
+                            
+                            # Try to parse and pretty print the JSON
+                            json_data = json.loads(json_str)
+                            relevant_lines.append(json.dumps(json_data, indent=2))
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, include the original line
+                            relevant_lines.append(line)
+                    else:
+                        # For non-JSON lines, filter out menu items and other noise
+                        if not any(x in line for x in ["Register connection", "Create table", "Insert data", 
+                                                      "Query data", "List tables", "Describe table", 
+                                                      "Update data", "Delete data", "Create index", 
+                                                      "Drop index", "Drop table", "Unregister connection", 
+                                                      "Exit", "Enter your choice"]):
+                            relevant_lines.append(line)
 
-            print(f"[DEBUG] Relevant output: {relevant_lines}")
+            # Format the output with CallToolResult wrapper
+            result_data = {
+                "CallToolResult": {
+                    "command_type": list(self.get_command_type(command_info["command_number"]))[0],
+                    "data": relevant_lines
+                }
+            }
             
-            return '\n'.join(relevant_lines)
+            formatted_output = json.dumps(result_data, indent=2)
+            print(f"[DEBUG] Formatted output: {formatted_output}")
+            
+            return formatted_output
 
         except Exception as e:
             print(f"[ERROR] MCP client error: {str(e)}")
-            raise RuntimeError(f"MCP client error: {str(e)}")
+            error_result = {
+                "CallToolResult": {
+                    "error": str(e)
+                }
+            }
+            return json.dumps(error_result)
         finally:
             if self.process:
                 print("[DEBUG] Cleaning up process...")
                 self.process.terminate()
                 await asyncio.sleep(1)
                 self.process.kill()
-
+    
+    def get_command_type(self, command_number):
+        command_map_inverse = {
+            "4": "SELECT",
+            "5": "LIST_TABLES",
+            "6": "DESCRIBE",
+            "2": "CREATE",
+            "3": "INSERT",
+            "7": "UPDATE",
+            "8": "DELETE",
+            "9": "CREATE_INDEX",
+            "10": "DROP_INDEX",
+            "11": "DROP"
+        }
+        return {command_map_inverse.get(command_number, "UNKNOWN")}
 class DatabaseSession:
     def __init__(self):
         self.analyzer = QueryAnalyzer()
         self.client = MCPClient()
+        self.tracker = ExecutionTracker()
 
     async def execute_query(self, query_info: str) -> str:
-        query_dict = json.loads(query_info)
-        command_info = await self.analyzer.analyze_query(
-            query_dict["command_type"],
-            query_dict["params"]
-        )
-        return await self.client.execute_command_sequence(command_info)
+        try:
+            query_dict = json.loads(query_info)
+            command_type = query_dict["command_type"]
+            
+            # Check if we've already performed this operation
+            if command_type == "LIST_TABLES" and self.tracker.has_listed_tables():
+                print("[DEBUG] Tables already listed, using cached knowledge")
+                result_data = {
+                    "CallToolResult": {
+                        "command_type": "LIST_TABLES",
+                        "data": ["Tables have already been listed. Please proceed to the next step."],
+                        "cached": True
+                    }
+                }
+                return json.dumps(result_data)
+                
+            elif command_type == "DESCRIBE":
+                table_name = query_dict["params"].get("table_name", "")
+                if table_name and self.tracker.has_described_table(table_name):
+                    print(f"[DEBUG] Table {table_name} already described, using cached knowledge")
+                    result_data = {
+                        "CallToolResult": {
+                            "command_type": "DESCRIBE",
+                            "table_name": table_name,
+                            "data": [f"Table {table_name} has already been described. Please proceed to the next step."],
+                            "cached": True
+                        }
+                    }
+                    return json.dumps(result_data)
+                    
+            elif command_type == "SELECT":
+                query = query_dict["params"].get("query", "")
+                if query and self.tracker.has_executed_query(query):
+                    print(f"[DEBUG] Query already executed: {query}")
+                    result_data = {
+                        "CallToolResult": {
+                            "command_type": "SELECT",
+                            "data": ["This query has already been executed. Please analyze the results or try a different query."],
+                            "cached": True
+                        }
+                    }
+                    return json.dumps(result_data)
+            
+            # Process the query
+            command_info = await self.analyzer.analyze_query(
+                command_type,
+                query_dict["params"]
+            )
+            
+            # Mark operation as completed
+            if command_type == "LIST_TABLES":
+                self.tracker.mark_tables_listed()
+            elif command_type == "DESCRIBE" and query_dict["params"].get("table_name"):
+                self.tracker.mark_table_described(query_dict["params"]["table_name"])
+            elif command_type == "SELECT" and query_dict["params"].get("query"):
+                self.tracker.mark_query_executed(query_dict["params"]["query"])
+                
+            result = await self.client.execute_command_sequence(command_info)
+            return result
+            
+        except json.JSONDecodeError:
+            error_result = {
+                "CallToolResult": {
+                    "error": "Invalid JSON format in query"
+                }
+            }
+            return json.dumps(error_result)
+        except Exception as e:
+            error_result = {
+                "CallToolResult": {
+                    "error": f"Error executing query: {str(e)}"
+                }
+            }
+            return json.dumps(error_result)
+    
+    def reset_tracker(self):
+        self.tracker.reset()
+
 
 async def main():
     try:
@@ -203,7 +355,8 @@ async def main():
             2. IGNORE all other output text, logs, or formatting
             3. Extract the actual database information from this JSON
             4. Base your next steps SOLELY on this extracted information
-            5. DO NOT repeat steps you've already completed unless there's an exception
+            5. If you see "cached": true in the result, it means you've already completed this step
+            6. DO NOT repeat steps you've already completed
             
             Use the following format:
             Question: the input question you must answer
@@ -237,7 +390,8 @@ async def main():
             tools=tools,
             verbose=True,
             max_iterations=10,
-            handle_parsing_errors=True
+            handle_parsing_errors=True,
+            early_stopping_method="force"  # Force stop after max_iterations
         )
         print("[DEBUG] Agent created successfully")
 
@@ -246,6 +400,9 @@ async def main():
                 user_query = input("\nPlease enter your database query in plain English (or 'exit' to quit): ")
                 if user_query.lower() == 'exit':
                     break
+                
+                # Reset tracker for each new query
+                db_session.reset_tracker()
                     
                 print(f"[DEBUG] Received user query: {user_query}")
                 print("\n[DEBUG] Executing agent...")
@@ -253,7 +410,7 @@ async def main():
                 print("[DEBUG] Agent execution completed")
                 
                 print("\nFinal Response:")
-                print(response)
+                print(response["output"])  # Just print the output field
                 
             except Exception as e:
                 print(f"\n[ERROR] Query failed: {str(e)}")

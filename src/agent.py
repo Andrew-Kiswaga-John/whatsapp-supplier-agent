@@ -56,7 +56,10 @@ async def query_database(state: AgentState) -> AgentState:
     errors = []
     db_results = ""
     
-    try:       
+    try: 
+        # Reset tracker for each new query
+        db_session.reset_tracker()      
+        
         # Create the database agent
         db_agent = await create_db_agent()
         
