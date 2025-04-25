@@ -70,7 +70,7 @@ async def setup_tools():
 
 async def main():
     # Initialize the language model
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro-exp-03-25", api_key=os.getenv("GEMINI_API_KEY"))
+    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", api_key=os.getenv("GEMINI_API_KEY"))
 
     # Get tools
     tools = await setup_tools()
