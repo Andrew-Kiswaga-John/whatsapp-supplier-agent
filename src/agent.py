@@ -337,7 +337,7 @@ async def listen_for_messages(phone_number: str) -> None:
 # Main function
 async def main():
     # Phone number to listen for
-    phone_number = "212600311326"
+    phone_number = os.getenv("PHONE_NUMBER")
     
     # Start listening for messages
     await listen_for_messages(phone_number)
