@@ -59,7 +59,7 @@ async def query_database(state: AgentState) -> AgentState:
     try: 
         # Reset tracker for each new query
         db_session.reset_tracker()      
-        
+
         # Create the database agent
         db_agent = await create_db_agent()
         
@@ -154,7 +154,7 @@ def send_introduction(phone_number: str) -> None:
     introduction = (
         "*Response From Angela*\n\n"
         "Hello! I'm Angela, your database assistant. I can help you query the database "
-        "and provide information about suppliers, orders, products, and more.\n\n"
+        "and provide information and insights from it.\n\n"
         "Just ask me any question about the database, and I'll do my best to answer it.\n\n"
         "When you're done, just say 'Bye Angela' to end our conversation."
     )
